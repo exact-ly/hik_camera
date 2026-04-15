@@ -1,6 +1,6 @@
 __title__ = "hik_camera"
-__version__ = "0.2.16"
+__version__ = "0.3.0"
 __author__ = "Lei Yang"
 __author_email__ = ""
 __url__ = ""
-__description__ = "Provides an easy-to-use API to control Hik industrial cameras. (supports Linux/Docker/Windows)"
+__description__ = "Minimal RGB-only API for Hikrobot industrial cameras"

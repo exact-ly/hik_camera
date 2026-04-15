@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hik_camera"
+version = "0.3.0"
+description = "Minimal RGB-only API for Hikrobot industrial cameras"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [{ name = "Lei Yang" }]
+dependencies = [
+    "numpy>=1.22",
+]
+
+[tool.setuptools.packages.find]
+include = ["hik_camera*"]

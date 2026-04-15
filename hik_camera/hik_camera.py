@@ -1,774 +1,375 @@
 #!/usr/bin/env python3
 
-"""
-Python wrapper for MVS camera SDK.
+"""Minimal RGB-only wrapper for Hikrobot MVS camera SDK."""
 
-Provides a class `HikCamera` that wraps the MVS camera SDK.
-Underlines the SDK's C APIs with ctypes library.
-"""
+from __future__ import annotations
 
 import ctypes
-from ctypes import byref, POINTER, cast, sizeof, memset
+from ctypes import byref, memset, sizeof
 import os
+import socket
 import sys
-from threading import Lock, Thread
-import time
-from typing import Any
+from threading import Lock
+from typing import Any, Iterable, Mapping
 
-import boxx
 import numpy as np
 
 
-# Retrieve the path to the Hikrobot MVS SDK given the operating system
 if sys.platform.startswith("win"):
-    # Hikrobot MVS SDK Location on Windows systems
     MVCAM_SDK_PATH = os.environ.get("MVCAM_SDK_PATH", r"C:\Program Files (x86)\MVS")
-    MvImportDir = os.path.join(MVCAM_SDK_PATH, r"Development\Samples\Python\MvImport")
+    MV_IMPORT_DIR = os.path.join(MVCAM_SDK_PATH, r"Development\Samples\Python\MvImport")
 else:
-    # Hikrobot MVS SDK Location on UNIX systems
     MVCAM_SDK_PATH = os.environ.get("MVCAM_SDK_PATH", "/opt/MVS")
-    MvImportDir = os.path.join(MVCAM_SDK_PATH, "Samples/64/Python/MvImport")
+    MV_IMPORT_DIR = os.path.join(MVCAM_SDK_PATH, "Samples/64/Python/MvImport")
 
-# Import SDK python wrapper from Hikrobot MVS SDK
-with boxx.impt(MvImportDir):
-    try:
-        import MvCameraControl_class as hik
-    except ModuleNotFoundError as e:
-        boxx.pred(
-            "ERROR: can't find MvCameraControl_class.py in: %s, please install MVS SDK"
-            % MvImportDir
-        )
-        raise e
 
-_lock_name_to_lock = {None: boxx.withfun()}
+if MV_IMPORT_DIR not in sys.path:
+    sys.path.insert(0, MV_IMPORT_DIR)
 
-# Convert 32-bit integer to IP address
-int_to_ip = (
-    lambda i: f"{(i & 0xff000000) >> 24}.{(i & 0x00ff0000) >> 16}.{(i & 0x0000ff00) >> 8}.{i & 0x000000ff}"
-)
+try:
+    import MvCameraControl_class as hik
+except ModuleNotFoundError as exc:
+    raise ModuleNotFoundError(
+        "Cannot import MvCameraControl_class. Install Hikrobot MVS SDK and verify "
+        f"MVCAM_SDK_PATH or default SDK path: {MV_IMPORT_DIR}"
+    ) from exc
 
-# Convert IP address to 32-bit integer
-ip_to_int = lambda ip: sum(
-    [int(s) << shift for s, shift in zip(ip.split("."), [24, 16, 8, 0])]
-)
+
+def ip_to_int(ip: str) -> int:
+    return sum(int(octet) << shift for octet, shift in zip(ip.split("."), [24, 16, 8, 0]))
 
 
 def get_host_ip_by_target_ip(target_ip: str) -> str:
-    """
-    Returns the IP address of the network interface
-    that is used to connect to the camera with the given IP address.
-
-    Args:
-        target_ip (str): IP address of the camera.
-
-    Returns:
-        IP address of the network interface that is used to connect to the camera.
-    """
-    import socket
-
-    return [
-        (s.connect((target_ip, 80)), s.getsockname()[0], s.close())
-        for s in [socket.socket(socket.AF_INET, socket.SOCK_DGRAM)]
-    ][0][1]
-
-
-def get_setting_df() -> boxx.pd.DataFrame:
-    """
-    Read the MvCameraNode-CH.csv file and return a pandas DataFrame
-    which contains the camera settings key names, dependencies, and data types.
-    """
-    csv = boxx.pd.read_csv(__file__.replace("hik_camera.py", "MvCameraNode-CH.csv"))
-    setting_df = boxx.pd.DataFrame()
-
-    def to_key(key):
-        if "[" in key:
-            key = key[: key.index("[")]
-        return key.strip()
-
-    def get_depend(key):
-        key = key.strip()
-        if "[" in key:
-            return key[key.index("[") + 1 : -1]
-        return ""
-
-    setting_df["key"] = csv[list(csv)[1]].map(to_key)
-    setting_df["depend"] = csv[list(csv)[1]].map(get_depend)
-    setting_df["dtype"] = csv[list(csv)[2]].map(lambda x: x.strip().lower())
-    return setting_df
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.connect((target_ip, 80))
+        return str(sock.getsockname()[0])
 
 
 class HikCamera(hik.MvCamera):
-    """
-    Class that wraps the MVS camera SDK, implementing it as a context manager.
-
-    API reference: %MVCAM_SDK_PATH%\Development\Documentations\Machine Vision Camera SDK Developer Guide Windows (C) V4.3.0.chm
-    """
-
-    continuous_adjust_exposure_cams = {}
-    _continuous_adjust_exposure_thread_on = False
+    _FLOAT_PARAM_KEYS = {"ExposureTime", "Gain"}
 
     def __init__(
         self,
-        ip: str = None,
-        host_ip: str = None,
-        setting_items: dict = None,
-        config: dict = None,
+        ip: str,
+        host_ip: str | None = None,
+        timeout_ms: int = 40000,
+        setting_items: Iterable[tuple[str, Any]] | Mapping[str, Any] | None = None,
     ) -> None:
-        """
-        Constructor for the HikCamera class.
+        if not ip:
+            raise ValueError("`ip` is required")
 
-        Args:
-            ip (str, optional): 相机 IP. Defaults to ips[0].
-            host_ip (str, optional): 从哪个网口. Defaults to None.
-            setting_items (dict, optional): 海康相机 xls 的标准命令和值, 更推荐 override setting. Defaults to None.
-            config (dict, optional): 该库的 config . Defaults to dict(lock_name=None(no_lock), repeat_trigger=1).
-        """
         super().__init__()
-        self.lock = (
-            Lock()
-        )  # Instantiate a lock used to prevent multiple threads from accessing the camera at the same time during critical operations
-        self.TIMEOUT_MS = 40000
-        self.is_open = False
-        self.last_time_get_frame = 0
-        self.setting_items = setting_items
-        self.config = config
-        if ip is None:
-            # Get all camera IP addresses
-            ip = self.get_all_ips()[0]
-        if host_ip is None:
-            # Get the IP address of the network interface
-            host_ip = get_host_ip_by_target_ip(ip)
         self._ip = ip
-        self.host_ip = host_ip
-        self._init()
+        self.host_ip = host_ip or get_host_ip_by_target_ip(ip)
+        self.timeout_ms = int(timeout_ms)
 
-    def _init(self) -> None:
-        self._init_by_spec_ip()
+        self._lock = Lock()
+        self._is_open = False
+        self._payload_size = 0
+        self._data_buf = None
+        self._frame_info = None
+        self._setting_items = self._normalize_setting_items(setting_items)
 
-    def setting(self) -> None:
-        try:
-            self.set_rgb()  # 取 RGB 图
+        self._create_handle()
 
-        except AssertionError:
-            pass
-        # self.set_raw() # 取 raw 图
-
-        # 手动曝光, 单位秒
-        # self.set_exposure_by_second(0.1)
-
-        # 设置为自动曝光
-        self.setitem("ExposureAuto", "Continuous")
-
-        # 每隔 120s 拍一次照片来调整自动曝光, 以防止太久没调整自动曝光, 导致曝光失效
-        # self.continuous_adjust_exposure(120)
-
-        # 初始化时候, 花两秒来调整自动曝光
-        # self.adjust_auto_exposure(2)
-        # self.setitem("GevSCPD", 200)  # 包延时, 单位 ns, 防止多相机同时拍摄丢包, 6 个百万像素相机推荐 15000
-
-    def _get_one_frame_to_buf(self) -> None:
-        """
-        Store camera frame and frame information in the corresponding buffers by reference.
-        """
-        # Thread-safe (atomic) camera triggering (single frame)
-        with self.lock:
-            # Software camera trigger
-            assert not self.MV_CC_SetCommandValue("TriggerSoftware")
-            # Frame acquisition:
-            # SDK C API will save the frame data to the buffer by reference (byref(self.data_buf))
-            # and will save the frame information to the frame information structure by reference
-            # (self.stFrameInfo, called by reference in the python wrapper for the C API)
-            assert not self.MV_CC_GetOneFrameTimeout(
-                byref(self.data_buf),
-                self.nPayloadSize,
-                self.stFrameInfo,
-                self.TIMEOUT_MS,
-            ), self.ip
-        self.last_time_get_frame = time.time()
-
-    def get_frame_with_config(self) -> None:
-        """
-        Frame acquisition from the camera.
-        """
-        # Get user-defined configuration (if any)
-        config = self.config if self.config else {}
-        # Get lock name from user configuration
-        lock_name = config.get("lock_name")
-        # Get lock from lock name, otherwise create a new lock
-        lock = (
-            _lock_name_to_lock[lock_name]
-            if lock_name in _lock_name_to_lock
-            else _lock_name_to_lock.setdefault(lock_name, Lock())
-        )
-        # Get number of times to trigger the camera from user configuration.
-        # Default is 1.
-        repeat_trigger = config.get("repeat_trigger", 1)
-        # Thread-safe (atomic) camera triggering for the given number of times
-        with lock:
-            for i in range(repeat_trigger):
-                self._get_one_frame_to_buf()
-
-    def get_frame(self) -> np.ndarray:
-        """
-        Get a frame from the camera.
-        """
-        # Retrieve the frame information generated at camera initialization
-        stFrameInfo = self.stFrameInfo
-
-        # Get frame from the camera
-        self.get_frame_with_config()
-        # Frame is stored in data_buf
-        # Frame information is stored in stFrameInfo
-
-        # Get the frame width and height from the frame information
-        h, w = stFrameInfo.nHeight, stFrameInfo.nWidth
-        # Get the frame bit depth from the frame information
-        self.bit = bit = self.nPayloadSize * 8 // h // w
-        self.shape = h, w
-        if bit == 8:
-            # BW image
-            img = np.array(self.data_buf).copy().reshape(*self.shape)
-        elif bit == 24:
-            # RGB image
-            self.shape = (h, w, 3)
-            img = np.array(self.data_buf).copy().reshape(*self.shape)
-        elif bit == 16:
-            # TODO is this a 16bit raw image?
-            raw = np.array(self.data_buf).copy().reshape(h, w, 2)
-            img = raw[..., 1].astype(np.uint16) * 256 + raw[..., 0]
-        elif bit == 12:
-            # TODO is this 12bit raw image?
-            self.shape = h, w
-            arr = np.array(self.data_buf).copy().astype(np.uint16)
-            arr2 = arr[1::3]
-            arrl = (arr[::3] << 4) + ((arr2 & ~np.uint16(15)) >> 4)
-            arrr = (arr[2::3] << 4) + (arr2 & np.uint16(15))
-            img = np.concatenate([arrl[..., None], arrr[..., None]], 1).reshape(
-                self.shape
-            )
-        return img
-
-    def reset(self) -> None:
-        """
-        Reset the camera.
-        """
-        # Thread-safe (atomic) camera reset.
-        with self.lock:
-            try:
-                self.MV_CC_SetCommandValue("DeviceReset")
-            except Exception as e:
-                print(e)
-            time.sleep(5)  # reset 后需要等一等
-            self.waite()
-            self._init()
-            self.__enter__()
-
-    def robust_get_frame(self) -> np.ndarray:
-        """
-        Returns a frame from the camera.
-        If an error occurs, the camera is reset and the frame is reacquired.
-
-        - Returns:
-            A numpy array of the frame.
-
-        遇到错误, 会自动 reset device 并 retry 的 get frame
-        - 支持断网重连后继续工作
-        """
-        try:
-            return self.get_frame()
-        except Exception as e:
-            print(boxx.prettyFrameLocation())
-            boxx.pred(type(e).__name__, e)
-            self.reset()
-            return self.get_frame()
-
-    def _ping(self) -> bool:
-        """
-        Returns True if the camera is connected to the network.
-        """
-        if sys.platform.startswith("win"):
-            return not os.system("ping -n 1 " + self.ip + " > nul")
+    @staticmethod
+    def _normalize_setting_items(
+        setting_items: Iterable[tuple[str, Any]] | Mapping[str, Any] | None,
+    ) -> tuple[tuple[str, Any], ...]:
+        if setting_items is None:
+            return ()
+        if isinstance(setting_items, Mapping):
+            items = list(setting_items.items())
         else:
-            if os.system("which ping>/dev/null"):
-                print("Not found ping in os.system")
-                boxx.sleep(18)
-                return True
-            return not os.system("ping -c 1 -w 1 " + self.ip + " > /dev/null")
+            items = list(setting_items)
+        return tuple((str(key), value) for key, value in items)
 
-    def waite(self, timeout: int = 20) -> None:
-        """
-        Check if the camera is connected to the network.
-        """
-        begin = time.time()
-        while not self._ping():
-            boxx.sleep(0.1)
-            if time.time() - begin > timeout:
-                raise TimeoutError(f"Lost connection to {self.ip} for {timeout}s!")
-
-    @classmethod
-    def get_all_ips(cls) -> list[str]:
-        """
-        Class method that returns a list of all connected camera IP addresses.
-
-        Returns:
-            List of strings of all connected Hik camera IP addresses.
-        """
-        # 通过新的进程, 绕过 hik sdk 枚举后无法 "无枚举连接相机"(使用 ip 直连)的 bug
-        get_all_ips_py = boxx.relfile("./get_all_ips.py")
-        ips = boxx.execmd(f'"{sys.executable}" "{get_all_ips_py}"').strip().split(" ")
-        return list(filter(None, ips))
-
-    @classmethod
-    def get_cams(cls, ips=None) -> dict[str, "HikCamera"]:
-        """
-        Class method that returns a dictionary of all connected cameras.
-
-        args:
-            ips (list[str], optional): List of IP addresses of the cameras to connect to. Defaults to None.
-
-        Returns:
-            Dictionary of all connected Hik cameras.
-        """
-        if ips is None:
-            ips = cls.get_all_ips()
-        else:
-            ips = sorted(ips)
-        cams = MultiHikCamera({ip: cls(ip) for ip in ips})
-        return cams
-
-    get_all_cams = get_cams
-
-    def set_rgb(self) -> None:
-        """
-        Set camera pixel format to RGB.
-        """
-        self.pixel_format = "RGB8Packed"
-        self.setitem("PixelFormat", self.pixel_format)
-
-    def set_raw(self, bit=12, packed=True) -> None:
-        if packed:
-            packed = bit % 8
-        pixel_formats = [
-            "Bayer%s%d%s" % (color_format, bit, "Packed" if packed else "")
-            for color_format in ["GB", "GR", "RG", "BG"]
-        ]
-        for pixel_format in pixel_formats:
-            try:
-                self.pixel_format = pixel_format
-                self.setitem("PixelFormat", self.pixel_format)
-                return
-            except AssertionError:
-                pass
-        raise NotImplementedError(
-            f"This camera's pixel_format not support any {bit}bit of {pixel_formats}"
-        )
-
-    def get_exposure(self) -> int:
-        """
-        Exposure time getter.
-        """
-        return self["ExposureTime"]
-
-    def set_exposure(self, t) -> None:
-        """
-        Exposure time setter.
-        """
-        assert not self.MV_CC_SetEnumValueByString("ExposureAuto", "Off")
-        assert not self.MV_CC_SetFloatValue("ExposureTime", t)
-
-    def get_exposure_by_second(self) -> float:
-        """
-        Exposure time getter, in seconds.
-        """
-        return self.get_exposure() * 1e-6
-
-    def set_exposure_by_second(self, t) -> None:
-        """
-        Exposure time setter, in seconds.
-        """
-        self.set_exposure(int(t / 1e-6))
-
-    def adjust_auto_exposure(self, t=2):
-        boxx.sleep(0.1)
-        try:
-            self.MV_CC_StartGrabbing()
-            print("before_exposure", self.get_exposure())
-            boxx.sleep(t)
-            print("after_exposure", self.get_exposure())
-        finally:
-            self.MV_CC_StopGrabbing()
-
-    def continuous_adjust_exposure(self, interval=60):
-        """
-        Set camera to continuous exposure mode.
-
-        触发模式下, 会额外起一条全局守护线程, 对每个注册的相机每隔大致 interval 秒, 拍一次照
-        以调整自动曝光.
-        如果某个相机正常拍照了, 守护线程也会得知那个相机更新过曝光
-        该功能会避免任意两次拍照的时间间隔过小, 而导致网络堵塞
-        # TODO 考虑分 lock_name 来起 n 个全局线程分开管理设备?
-        """
-        self.setitem("ExposureAuto", "Continuous")
-        self.interval = interval
-        HikCamera.continuous_adjust_exposure_cams[self.ip] = self
-        if not HikCamera._continuous_adjust_exposure_thread_on:
-            HikCamera._continuous_adjust_exposure_thread_on = True
-            boxx.setTimeout(self._continuous_adjust_exposure_thread, interval)
-
-    @classmethod
-    def _continuous_adjust_exposure_thread(cls):
-        cams = [
-            cam for cam in cls.continuous_adjust_exposure_cams.values() if cam.is_open
-        ]
-        if not len(cams):
-            cls._continuous_adjust_exposure_thread_on = False
-            return
-        now = time.time()
-        last_get_frame = max([cam.last_time_get_frame for cam in cams])
-
-        # 选择最需要拍照的相机
-        cam = sorted(
-            cams, key=lambda cam: now - cam.last_time_get_frame - cam.interval
-        )[-1]
-        # 避免任意两次拍照的时间间隔过小, 而导致网络堵塞
-        min_get_frame_gap = max(cam.interval / len(cams) / 4, 1)
-        # 表示当前相机距离上次拍照的时间是否大于等于用户设置的拍照时间间隔（cam.interval）。
-        sufficient_time_since_last_frame = now - cam.last_time_get_frame >= cam.interval
-        # 表示距离所有相机中最近一次拍照的时间是否大于等于计算出的最小拍照间隔
-        sufficient_gap_between_frames = now - last_get_frame >= min_get_frame_gap
-        if sufficient_time_since_last_frame and sufficient_gap_between_frames:
-            # boxx.pred("adjust", cam.ip, time.time())
-            try:
-                cam.get_frame_with_config()
-            except Exception as e:
-                boxx.pred(type(e).__name__, e)
-        boxx.setTimeout(cls._continuous_adjust_exposure_thread, 1)
-
-    def get_shape(self) -> tuple[int, int]:
-        """
-        Returns the camera frame shape.
-        """
-        if not hasattr(self, "shape"):
-            self.robust_get_frame()
-        return self.shape
-
-    @property
-    def is_raw(self):
-        return "Bayer" in self.__dict__.get("pixel_format", "RGB8")
+    @staticmethod
+    def _check_ok(ret: int, action: str) -> None:
+        if ret != 0:
+            raise RuntimeError(f"{action} failed with code 0x{ret:08x}")
 
     @property
     def ip(self) -> str:
-        if not hasattr(self, "_ip"):
-            self._ip = self.getitem("GevCurrentIPAddress")
         return self._ip
 
-    def raw_to_uint8_rgb(self, raw, poww=1, demosaicing_method="Malvar2004"):
-        from process_raw import RawToRgbUint8
+    def _create_handle(self) -> None:
+        st_dev_info = hik.MV_CC_DEVICE_INFO()
+        st_gige = hik.MV_GIGE_DEVICE_INFO()
+        st_gige.nCurrentIp = ip_to_int(self.ip)
+        st_gige.nNetExport = ip_to_int(self.host_ip)
+        st_dev_info.nTLayerType = hik.MV_GIGE_DEVICE
+        st_dev_info.SpecialInfo.stGigEInfo = st_gige
+        self._check_ok(self.MV_CC_CreateHandle(st_dev_info), "MV_CC_CreateHandle")
 
-        transfer_func = RawToRgbUint8(
-            bit=self.bit,
-            poww=poww,
-            demosaicing_method=demosaicing_method,
-            pattern=self.get_bayer_pattern(),
+    def _set_enum(self, key: str, value: int) -> None:
+        self._check_ok(
+            self.MV_CC_SetEnumValue(key, value),
+            f"MV_CC_SetEnumValue({key!r}, {value!r})",
         )
-        rgb = transfer_func(raw)
-        return rgb
 
-    def save_raw(self, raw, dng_path, compress=False):
-        from process_raw import DngFile
+    def _set_enum_by_string(self, key: str, value: str) -> None:
+        self._check_ok(
+            self.MV_CC_SetEnumValueByString(key, value),
+            f"MV_CC_SetEnumValueByString({key!r}, {value!r})",
+        )
 
-        pattern = self.get_bayer_pattern()
-        DngFile.save(dng_path, raw, bit=self.bit, pattern=pattern, compress=compress)
-        return dng_path
+    def _set_bool(self, key: str, value: bool) -> None:
+        self._check_ok(
+            self.MV_CC_SetBoolValue(key, value),
+            f"MV_CC_SetBoolValue({key!r}, {value!r})",
+        )
 
-    def save(self, img: np.ndarray, path: str = "") -> None:
-        """
-        Save an image to the specified path.
-        """
-        if self.is_raw:
-            return self.save_raw(img, path or f"/tmp/{self.ip}.dng")
-        path = path or f"/tmp/{self.ip}.jpg"
-        boxx.imsave(path, img)
-        return path
+    def _set_float(self, key: str, value: float) -> None:
+        self._check_ok(
+            self.MV_CC_SetFloatValue(key, float(value)),
+            f"MV_CC_SetFloatValue({key!r}, {value!r})",
+        )
 
-    def get_bayer_pattern(self):
-        assert self.is_raw
-        if "BayerGB" in self.pixel_format:
-            return "GBRG"
-        elif "BayerGR" in self.pixel_format:
-            return "GRBG"
-        elif "BayerRG" in self.pixel_format:
-            return "RGGB"
-        elif "BayerBG" in self.pixel_format:
-            return "BGGR"
-        raise NotImplementedError(self.pixel_format)
-
-    def __enter__(self) -> "HikCamera":
-        """
-        Camera initialization : open, setup, and start grabbing frames from the device.
-        """
-
-        # Open the camera with MVS SDK with exclusive access
-        assert not self.MV_CC_OpenDevice(hik.MV_ACCESS_Exclusive, 0)
-
-        # Initialize the camera with a fixes set of settings
-        # TODO rember setting
-        self.setitem("TriggerMode", hik.MV_TRIGGER_MODE_ON)
-        self.setitem("TriggerSource", hik.MV_TRIGGER_SOURCE_SOFTWARE)
-        self.setitem("AcquisitionFrameRateEnable", False)
-        self.setting()
-
-        # Set the camera settings to the user-defined settings
-        if self.setting_items is not None:
-            if isinstance(self.setting_items, dict):
-                self.setting_items = self.setting_items.values()
-            for key, value in self.setting_items:
-                self.setitem(key, value)
-
-        # Instantiate a structure to hold the payload size
-        stParam = hik.MVCC_INTVALUE()
-        # Initialize the payload size structure to zero
-        memset(byref(stParam), 0, sizeof(hik.MVCC_INTVALUE))
-        # Get the payload size from the camera and store it in the payload size structure by reference
-        assert not self.MV_CC_GetIntValue("PayloadSize", stParam)
-        # Store the payload size in the camera object
-        self.nPayloadSize = stParam.nCurValue
-        # Allocate a buffer to store the frame data.
-        # You'll need memory for self.nPayloadSize unsigned 8-bit integers (0-255)
-        self.data_buf = (ctypes.c_ubyte * self.nPayloadSize)()
-
-        # Instantiate a structure to hold the frame information
-        self.stFrameInfo = hik.MV_FRAME_OUT_INFO_EX()
-        # Initialize the frame information structure to zero
-        memset(byref(self.stFrameInfo), 0, sizeof(self.stFrameInfo))
-
-        # Start grabbing frames from the camera
-        assert not self.MV_CC_StartGrabbing()
-
-        self.is_open = True  # Mark the camera as open
-        return self
-
-    def set_OptimalPacketSize(self):
-        # ch:探测网络最佳包大小(只对GigE相机有效) | en:Detection network optimal package size(It only works for the GigE camera)
-        # print("GevSCPSPacketSize", self["GevSCPSPacketSize"])
-        with self.high_speed_lock:
-            nPacketSize = self.MV_CC_GetOptimalPacketSize()
-        assert nPacketSize
-        assert not self.MV_CC_SetIntValue("GevSCPSPacketSize", nPacketSize)
-
-    def __exit__(self, *l) -> None:
-        """
-        Run camera termination code: stop grabbing frames and close the device.
-        """
-        self.setitem("TriggerMode", hik.MV_TRIGGER_MODE_OFF)
-        self.setitem("AcquisitionFrameRateEnable", True)
-        assert not self.MV_CC_StopGrabbing()
-        self.MV_CC_CloseDevice()
-        self.is_open = False
-
-    def __del__(self) -> None:
-        self.MV_CC_DestroyHandle()
-
-    def MV_CC_CreateHandle(self, mvcc_dev_info: hik.MV_CC_DEVICE_INFO) -> None:
-        """
-        Create a handle to a GigE camera given its device info.
-        """
-        self.mvcc_dev_info = mvcc_dev_info
-        self._ip = int_to_ip(mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp)
-        assert not super().MV_CC_CreateHandle(mvcc_dev_info)
-
-    high_speed_lock = Lock()
-    setting_df = get_setting_df()
+    def _get_float(self, key: str) -> float:
+        value = ctypes.c_float()
+        self._check_ok(self.MV_CC_GetFloatValue(key, value), f"MV_CC_GetFloatValue({key!r})")
+        return float(value.value)
 
     def getitem(self, key: str) -> Any:
-        """
-        Get a camera setting value given its key.
-        """
-        # Get setting dataframe
-        df = self.setting_df
-        # Get key setting data type
-        dtype = df[df.key == key]["dtype"].iloc[0]
-        # Retrieve parameter getter from MVS SDK for the given data type
-        if dtype == "iboolean":
-            get_func = self.MV_CC_GetBoolValue
-            value = ctypes.c_bool()
-        if dtype == "icommand":
-            get_func = self.MV_CC_GetCommandValue
-        if dtype == "ienumeration":
-            get_func = self.MV_CC_GetEnumValue
-            value = ctypes.c_uint32()
-        if dtype == "ifloat":
-            get_func = self.MV_CC_GetFloatValue
-            value = ctypes.c_float()
-        if dtype == "iinteger":
-            get_func = self.MV_CC_GetIntValue
-            value = ctypes.c_int()
-        if dtype == "istring":
-            get_func = self.MV_CC_GetStringValue
-            value = (ctypes.c_char * 50)()
-        if dtype == "register":
-            get_func = self.MV_CC_RegisterEventCallBackEx
-        # print(get_func, value)
-        # Thread-safe (atomic) parameter reading from the camera.
-        with self.lock:
-            assert not get_func(
-                key, value
-            ), f"{get_func.__name__}('{key}', {value}) not return 0"
-        return value.value
+        attempts = []
+
+        def _new_int_value():
+            int_value = hik.MVCC_INTVALUE()
+            memset(byref(int_value), 0, sizeof(hik.MVCC_INTVALUE))
+            return int_value
+
+        def _attempt(getter_name: str, build_arg):
+            getter = getattr(self, getter_name)
+            arg = build_arg()
+            try:
+                ret = getter(key, arg)
+            except Exception as exc:
+                attempts.append((getter_name, exc))
+                return None
+            if ret != 0:
+                attempts.append((getter_name, ret))
+                return None
+            if getter_name == "MV_CC_GetFloatValue":
+                return float(arg.value)
+            if getter_name == "MV_CC_GetIntValue":
+                return int(arg.nCurValue)
+            if getter_name == "MV_CC_GetBoolValue":
+                return bool(arg.value)
+            if getter_name == "MV_CC_GetEnumValue":
+                return int(arg.value)
+            if getter_name == "MV_CC_GetStringValue":
+                value = arg.value
+                if isinstance(value, bytes):
+                    return value.decode(errors="ignore")
+                return value
+            return None
+
+        getters = [
+            ("MV_CC_GetFloatValue", ctypes.c_float),
+            ("MV_CC_GetIntValue", _new_int_value),
+            ("MV_CC_GetBoolValue", ctypes.c_bool),
+            ("MV_CC_GetEnumValue", ctypes.c_uint32),
+            ("MV_CC_GetStringValue", lambda: ctypes.create_string_buffer(256)),
+        ]
+
+        with self._lock:
+            for getter_name, build_arg in getters:
+                value = _attempt(getter_name, build_arg)
+                if value is not None:
+                    return value
+
+        error_parts = []
+        for name, result in attempts:
+            if isinstance(result, Exception):
+                error_parts.append(f"{name}: {type(result).__name__}: {result}")
+            else:
+                error_parts.append(f"{name}: 0x{result:08x}")
+        raise RuntimeError(f"Cannot read camera parameter {key!r}. Attempts: {'; '.join(error_parts)}")
 
     def setitem(self, key: str, value: Any) -> None:
-        """
-        Set a camera setting to a given value.
-        """
-        # Get setting dataframe
-        df = self.setting_df
-        # Get key setting data type
-        dtype = df[df.key == key]["dtype"].iloc[0]
-        # Retrieve parameter setter from MVS SDK for the given data type
-        if dtype == "iboolean":
-            set_func = self.MV_CC_SetBoolValue
-        if dtype == "icommand":
-            set_func = self.MV_CC_SetCommandValue
-        if dtype == "ienumeration":
-            if isinstance(value, str):
-                set_func = self.MV_CC_SetEnumValueByString
+        attempts = []
+
+        if isinstance(value, bool):
+            setters = [
+                ("MV_CC_SetBoolValue", bool(value)),
+                ("MV_CC_SetEnumValue", int(value)),
+                ("MV_CC_SetIntValue", int(value)),
+            ]
+        elif isinstance(value, str):
+            setters = [
+                ("MV_CC_SetEnumValueByString", value),
+                ("MV_CC_SetStringValue", value),
+            ]
+        elif isinstance(value, int):
+            if key in self._FLOAT_PARAM_KEYS:
+                setters = [
+                    ("MV_CC_SetFloatValue", float(value)),
+                    ("MV_CC_SetIntValue", int(value)),
+                    ("MV_CC_SetEnumValue", int(value)),
+                ]
             else:
-                set_func = self.MV_CC_SetEnumValue
-        if dtype == "ifloat":
-            set_func = self.MV_CC_SetFloatValue
-        if dtype == "iinteger":
-            set_func = self.MV_CC_SetIntValue
-        if dtype == "istring":
-            set_func = self.MV_CC_SetStringValue
-        if dtype == "register":
-            set_func = self.MV_CC_RegisterEventCallBackEx
-        # Thread-safe (atomic) parameter setting of the camera.
-        with self.lock:
-            assert not set_func(
-                key, value
-            ), f"{set_func.__name__}('{key}', {value}) not return 0"
+                setters = [
+                    ("MV_CC_SetIntValue", int(value)),
+                    ("MV_CC_SetFloatValue", float(value)),
+                    ("MV_CC_SetEnumValue", int(value)),
+                ]
+        elif isinstance(value, float):
+            setters = [
+                ("MV_CC_SetFloatValue", float(value)),
+                ("MV_CC_SetIntValue", int(value)),
+            ]
+        else:
+            raise TypeError(f"Unsupported parameter type for {key!r}: {type(value).__name__}")
+
+        with self._lock:
+            for setter_name, candidate_value in setters:
+                setter = getattr(self, setter_name)
+                try:
+                    ret = setter(key, candidate_value)
+                except Exception as exc:
+                    attempts.append((setter_name, exc))
+                    continue
+                if ret == 0:
+                    return
+                attempts.append((setter_name, ret))
+
+        error_parts = []
+        for name, result in attempts:
+            if isinstance(result, Exception):
+                error_parts.append(f"{name}: {type(result).__name__}: {result}")
+            else:
+                error_parts.append(f"{name}: 0x{result:08x}")
+        raise RuntimeError(
+            f"Cannot set camera parameter {key!r} to {value!r}. "
+            f"Attempts: {'; '.join(error_parts)}"
+        )
 
     __getitem__ = getitem
     __setitem__ = setitem
 
-    def _init_by_spec_ip(self) -> None:
-        """
-        Create a handle to reference a GigE camera
-        given its IP address and the IP address of the network interface.
+    def set_exposure(self, exposure_us: float) -> None:
+        self._set_enum_by_string("ExposureAuto", "Off")
+        self._set_float("ExposureTime", float(exposure_us))
 
-        MVS SDK 有 Bug, 在 linux 下 调用完"枚举设备" 接口后, 再调用"无枚举连接相机" 会无法打开相机.
-        同一个进程的 SDK 枚举完成后不能再直连. 需要新建一个进程. 或者不枚举 直接直连就没问题
-        """
-        # Instantiate a device info structure
-        stDevInfo = hik.MV_CC_DEVICE_INFO()
-        # Instantiate a GigE device info structure
-        stGigEDev = hik.MV_GIGE_DEVICE_INFO()
-        # Set the GigE device info structure's IP address to the camera's IP address
-        stGigEDev.nCurrentIp = ip_to_int(self.ip)
-        # Set the GigE device info structure's network interface IP address to the network interface's IP address
-        stGigEDev.nNetExport = ip_to_int(self.host_ip)
-        stDevInfo.nTLayerType = hik.MV_GIGE_DEVICE  # When using GigE cameras
-        # Set the device info structure's GigE device info to the GigE device info structure
-        stDevInfo.SpecialInfo.stGigEInfo = stGigEDev
-        # Create a handle to reference the camera given its device info
-        assert not self.MV_CC_CreateHandle(stDevInfo)
+    def get_exposure(self) -> float:
+        return self._get_float("ExposureTime")
 
-    def _init_by_enum(self) -> None:
-        stDevInfo = self._get_dev_info(self.ip)
-        assert not self.MV_CC_CreateHandle(stDevInfo)
+    def set_gain(self, gain: float) -> None:
+        self._set_enum_by_string("GainAuto", "Off")
+        self._set_float("Gain", float(gain))
 
-    @classmethod
-    def _get_dev_info(cls, ip: str = None) -> dict[str, hik.MV_CC_DEVICE_INFO]:
-        """
-        Class method that returns a list of all connected camera IP addresses
-        and their corresponding device info.
+    def get_gain(self) -> float:
+        return self._get_float("Gain")
 
-        Args:
-            ip (str, optional): IP address of the camera. Defaults to None.
+    def _configure_camera(self) -> None:
+        self._set_enum("TriggerMode", hik.MV_TRIGGER_MODE_ON)
+        self._set_enum("TriggerSource", hik.MV_TRIGGER_SOURCE_SOFTWARE)
+        self._set_bool("AcquisitionFrameRateEnable", False)
+        self._set_enum_by_string("PixelFormat", "RGB8Packed")
 
-        Returns:
-            Dict of all connected Hik camera IP addresses and their device info.
-        """
-        if not hasattr(cls, "ip_to_dev_info"):
-            ip_to_dev_info = {}
-            # Instantiate a device info list structure
-            deviceList = hik.MV_CC_DEVICE_INFO_LIST()
-            # Set device communication protocol
-            tlayerType = hik.MV_GIGE_DEVICE  # | MV_USB_DEVICE
-            # Enumerate all devices on the network by MVS SDK APIs call.
-            assert not hik.MvCamera.MV_CC_EnumDevices(tlayerType, deviceList)
-            # Iterate through all devices on the network and retrieve devices IPs
-            for i in range(0, deviceList.nDeviceNum):
-                # Cast MVS device info structure pointer to ctypes device info structure pointer and retrieve device info
-                mvcc_dev_info = cast(
-                    deviceList.pDeviceInfo[i], POINTER(hik.MV_CC_DEVICE_INFO)
-                ).contents
-                # Get the device IP address from the device info structure
-                _ip = int_to_ip(mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp)
-                if mvcc_dev_info.nTLayerType == hik.MV_GIGE_DEVICE:
-                    ip_to_dev_info[_ip] = mvcc_dev_info
-            cls.ip_to_dev_info = {
-                ip: ip_to_dev_info[ip] for ip in sorted(ip_to_dev_info)
-            }
-        if ip is None:
-            return cls.ip_to_dev_info
-        return cls.ip_to_dev_info[ip]
+    def _apply_setting_items(self) -> None:
+        for key, value in self._setting_items:
+            self.setitem(key, value)
 
-    @classmethod
-    def get_cam(cls) -> "HikCamera":
-        """
-        Returns the first connected camera.
-        """
-        ips = cls.get_all_ips()
-        cam = cls(ips[0])
-        return cam
+    def _allocate_buffers(self) -> None:
+        st_param = hik.MVCC_INTVALUE()
+        memset(byref(st_param), 0, sizeof(hik.MVCC_INTVALUE))
+        self._check_ok(self.MV_CC_GetIntValue("PayloadSize", st_param), "MV_CC_GetIntValue('PayloadSize')")
 
+        self._payload_size = int(st_param.nCurValue)
+        self._data_buf = (ctypes.c_ubyte * self._payload_size)()
+        self._frame_info = hik.MV_FRAME_OUT_INFO_EX()
+        memset(byref(self._frame_info), 0, sizeof(self._frame_info))
 
-class MultiHikCamera(dict):
-    def __getattr__(self, attr):
-        if not callable(getattr(next(iter(self.values())), attr)):
-            return {k: getattr(cam, attr) for k, v in self.items()}
+    def _validate_rgb8_output(self, frame: np.ndarray) -> None:
+        if frame.dtype != np.uint8 or frame.ndim != 3 or frame.shape[2] != 3:
+            raise RuntimeError(
+                "Camera must output RGB8Packed. Captured frame is not uint8 HxWx3. "
+                "Raw/Bayer formats are intentionally unsupported in this version."
+            )
 
-        def func(*args, **kwargs):
-            threads = []
-            res = {}
+    def __enter__(self) -> "HikCamera":
+        self._check_ok(
+            self.MV_CC_OpenDevice(hik.MV_ACCESS_Exclusive, 0),
+            "MV_CC_OpenDevice",
+        )
 
-            def _func(ip, cam):
-                res[ip] = getattr(cam, attr)(*args, **kwargs)
+        self._configure_camera()
+        self._apply_setting_items()
+        self._allocate_buffers()
+        self._check_ok(self.MV_CC_StartGrabbing(), "MV_CC_StartGrabbing")
+        self._is_open = True
 
-            for ip, cam in self.items():
-                thread = Thread(target=_func, args=(ip, cam))
-                thread.start()
-                threads.append(thread)
-                # thread.join()
-            [thread.join() for thread in threads]
-            res = {ip: res[ip] for ip in sorted(res)}
-            return res
-
-        return func
-
-    def __enter__(self):
-        self.__getattr__("__enter__")()
+        frame = self.get_frame()
+        self._validate_rgb8_output(frame)
         return self
 
-    def __exit__(self, *l):
-        self.__getattr__("__exit__")(*l)
+    def get_frame(self) -> np.ndarray:
+        if not self._is_open:
+            raise RuntimeError("Camera is not open. Use `with HikCamera(...) as cam:` first.")
+
+        with self._lock:
+            self._check_ok(
+                self.MV_CC_SetCommandValue("TriggerSoftware"),
+                "MV_CC_SetCommandValue('TriggerSoftware')",
+            )
+            self._check_ok(
+                self.MV_CC_GetOneFrameTimeout(
+                    byref(self._data_buf),
+                    self._payload_size,
+                    self._frame_info,
+                    self.timeout_ms,
+                ),
+                "MV_CC_GetOneFrameTimeout",
+            )
+
+        height = int(self._frame_info.nHeight)
+        width = int(self._frame_info.nWidth)
+        frame_len = int(self._frame_info.nFrameLen)
+        expected_frame_len = height * width * 3
+
+        if frame_len != expected_frame_len:
+            raise RuntimeError(
+                "Camera frame is not RGB8Packed. "
+                f"Expected {expected_frame_len} bytes, got {frame_len}."
+            )
+
+        frame = np.ctypeslib.as_array(self._data_buf, shape=(self._payload_size,))
+        return frame[:frame_len].copy().reshape(height, width, 3)
+
+    def robust_get_frame(self) -> np.ndarray:
+        return self.get_frame()
+
+    def close(self) -> None:
+        if not self._is_open:
+            return
+
+        try:
+            self.MV_CC_StopGrabbing()
+        finally:
+            self.MV_CC_CloseDevice()
+            self._is_open = False
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+        try:
+            self.MV_CC_DestroyHandle()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
+    ip = os.environ.get("HIK_CAMERA_IP")
+    if not ip:
+        raise SystemExit("Set HIK_CAMERA_IP to run the module demo.")
 
-    ips = HikCamera.get_all_ips()
-    print("All camera IP adresses:", ips)
-    ip = ips[0]
-    cam = HikCamera(ip)
-    with cam, boxx.timeit("cam.get_frame"):
-        img = cam.robust_get_frame()  # Default is RGB
-        print("Saveing image to:", cam.save(img))
-
-    print("-" * 40)
-
-    cams = HikCamera.get_all_cams()
-    with cams, boxx.timeit("cams.get_frame"):
-        imgs = cams.robust_get_frame()  # 返回一个 dict, key 是 ip, value 是图像
-        print("imgs = cams.robust_get_frame()")
-        boxx.tree(imgs)
+    with HikCamera(ip=ip) as cam:
+        frame = cam.get_frame()
+        print(f"Captured frame: shape={frame.shape}, dtype={frame.dtype}")
