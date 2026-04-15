@@ -4,6 +4,7 @@ tmp_*
 MvSdkLog
 
 .vscode
+.idea/
 *.pyc
 __pycache__/
 
