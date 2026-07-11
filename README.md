@@ -69,9 +69,34 @@ with HikCamera(
     rgb = cam.get_frame()
 ```
 
+## Binning
+
+Set binning before the camera starts grabbing frames. `get_frame()` still returns RGB `uint8` (`H x W x 3`); the dimensions come from the camera after binning.
+
+```python
+from hik_camera import HikCamera
+
+with HikCamera(ip="10.101.68.102", binning=2) as cam:
+    rgb = cam.get_frame()
+
+with HikCamera(ip="10.101.68.102", binning=(2, 1)) as cam:
+    rgb = cam.get_frame()
+```
+
+Equivalent pre-open setter:
+
+```python
+cam = HikCamera(ip="10.101.68.102")
+cam.set_binning(2)
+
+with cam:
+    rgb = cam.get_frame()
+```
+
 ## Existing wrapper compatibility
 
 - `HikCamera(..., setting_items=[("Width", 1920), ("Height", 1080), ...])` is supported.
+- `HikCamera(..., setting_items=[("BinningHorizontal", 2), ("BinningVertical", 2)])` is supported.
 - `camera["ParamName"] = value` is supported for common bool/int/float/string nodes.
 - `robust_get_frame()` is available as a compatibility alias to `get_frame()`.
 

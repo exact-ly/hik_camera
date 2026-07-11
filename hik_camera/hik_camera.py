@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Minimal RGB-only wrapper for Hikrobot MVS camera SDK."""
+"""Minimal RGB wrapper for Hikrobot MVS camera SDK."""
 
 from __future__ import annotations
 
@@ -84,6 +84,8 @@ class HikCamera(hik.MvCamera):
         host_ip: str | None = None,
         timeout_ms: int = 40000,
         capture_format: str | None = None,
+        binning: int | tuple[int, int] | None = None,
+        binning_selector: str | int | None = None,
         setting_items: Iterable[tuple[str, Any]] | Mapping[str, Any] | None = None,
     ) -> None:
         if not ip:
@@ -94,6 +96,8 @@ class HikCamera(hik.MvCamera):
         self.host_ip = host_ip or get_host_ip_by_target_ip(ip)
         self.timeout_ms = int(timeout_ms)
         self.capture_format = capture_format
+        self.binning = self._normalize_binning(binning)
+        self.binning_selector = binning_selector
         self.last_capture_format = None
         self.last_pixel_type = None
         self.bit = None
@@ -119,6 +123,24 @@ class HikCamera(hik.MvCamera):
         else:
             items = list(setting_items)
         return tuple((str(key), value) for key, value in items)
+
+    @staticmethod
+    def _normalize_binning(binning: int | tuple[int, int] | None) -> tuple[int, int] | None:
+        if binning is None:
+            return None
+        if isinstance(binning, int):
+            horizontal = vertical = binning
+        else:
+            try:
+                horizontal, vertical = binning
+            except (TypeError, ValueError) as exc:
+                raise ValueError("`binning` must be an int or a two-item (horizontal, vertical) tuple") from exc
+
+        horizontal = int(horizontal)
+        vertical = int(vertical)
+        if horizontal < 1 or vertical < 1:
+            raise ValueError("Binning values must be positive integers")
+        return horizontal, vertical
 
     @staticmethod
     def _check_ok(ret: int, action: str) -> None:
@@ -313,18 +335,46 @@ class HikCamera(hik.MvCamera):
         packed_suffix = "Packed" if packed and bit % 8 else ""
         self.set_capture_format(f"Bayer{pattern}{int(bit)}{packed_suffix}")
 
+    def set_binning(
+        self,
+        horizontal: int,
+        vertical: int | None = None,
+        selector: str | int | None = None,
+    ) -> None:
+        if self._is_open:
+            raise RuntimeError("Binning must be set before opening the camera.")
+        self.binning = self._normalize_binning((horizontal, horizontal if vertical is None else vertical))
+        self.binning_selector = selector
+
+    def _apply_binning(self) -> None:
+        if self.binning is None:
+            return
+
+        horizontal, vertical = self.binning
+        if self.binning_selector is not None:
+            self.setitem("BinningSelector", self.binning_selector)
+        self.setitem("BinningHorizontal", horizontal)
+        self.setitem("BinningVertical", vertical)
+
     def _configure_camera(self) -> None:
         self._set_enum("TriggerMode", hik.MV_TRIGGER_MODE_ON)
         self._set_enum("TriggerSource", hik.MV_TRIGGER_SOURCE_SOFTWARE)
         self._set_bool("AcquisitionFrameRateEnable", False)
         if self.capture_format is not None:
             self._set_enum_by_string("PixelFormat", self.capture_format)
+        self._apply_binning()
 
     def _apply_setting_items(self) -> None:
         for key, value in self._setting_items:
             self.setitem(key, value)
             if key == "PixelFormat" and isinstance(value, str):
                 self.capture_format = value
+            elif key == "BinningSelector":
+                self.binning_selector = value
+            elif key == "BinningHorizontal" and self.binning is not None:
+                self.binning = (int(value), self.binning[1])
+            elif key == "BinningVertical" and self.binning is not None:
+                self.binning = (self.binning[0], int(value))
 
     def _allocate_buffers(self) -> None:
         st_param = hik.MVCC_INTVALUE()
