@@ -7,6 +7,7 @@ from __future__ import annotations
 import ctypes
 from ctypes import byref, memset, sizeof
 import os
+import re
 import socket
 import sys
 from threading import Lock
@@ -47,12 +48,42 @@ def get_host_ip_by_target_ip(target_ip: str) -> str:
 
 class HikCamera(hik.MvCamera):
     _FLOAT_PARAM_KEYS = {"ExposureTime", "Gain"}
+    _BAYER_FORMAT_RE = re.compile(r"^Bayer(?P<pattern>GB|GR|RG|BG)(?P<bit>8|10|12|16)(?P<packed>Packed)?$")
+    _PIXEL_TYPE_FORMATS = {
+        0x01080001: "Mono8",
+        0x01100007: "Mono16",
+        0x01080008: "BayerGR8",
+        0x01080009: "BayerRG8",
+        0x0108000A: "BayerGB8",
+        0x0108000B: "BayerBG8",
+        0x0110000C: "BayerGR10",
+        0x0110000D: "BayerRG10",
+        0x0110000E: "BayerGB10",
+        0x0110000F: "BayerBG10",
+        0x01100010: "BayerGR12",
+        0x01100011: "BayerRG12",
+        0x01100012: "BayerGB12",
+        0x01100013: "BayerBG12",
+        0x02180014: "RGB8Packed",
+        0x02180015: "BGR8Packed",
+        0x010C002A: "BayerGR12Packed",
+        0x010C002B: "BayerRG12Packed",
+        0x010C002C: "BayerGB12Packed",
+        0x010C002D: "BayerBG12Packed",
+    }
+    _BAYER_PATTERNS = {
+        "GB": "GBRG",
+        "GR": "GRBG",
+        "RG": "RGGB",
+        "BG": "BGGR",
+    }
 
     def __init__(
         self,
         ip: str,
         host_ip: str | None = None,
         timeout_ms: int = 40000,
+        capture_format: str | None = None,
         setting_items: Iterable[tuple[str, Any]] | Mapping[str, Any] | None = None,
     ) -> None:
         if not ip:
@@ -62,6 +93,11 @@ class HikCamera(hik.MvCamera):
         self._ip = ip
         self.host_ip = host_ip or get_host_ip_by_target_ip(ip)
         self.timeout_ms = int(timeout_ms)
+        self.capture_format = capture_format
+        self.last_capture_format = None
+        self.last_pixel_type = None
+        self.bit = None
+        self.shape = None
 
         self._lock = Lock()
         self._is_open = False
@@ -262,15 +298,33 @@ class HikCamera(hik.MvCamera):
     def get_gain(self) -> float:
         return self._get_float("Gain")
 
+    def set_capture_format(self, capture_format: str) -> None:
+        if self._is_open:
+            raise RuntimeError("Capture format must be set before opening the camera.")
+        self.capture_format = str(capture_format)
+
+    def set_rgb(self) -> None:
+        self.set_capture_format("RGB8Packed")
+
+    def set_bayer(self, pattern: str = "GB", bit: int = 12, packed: bool = True) -> None:
+        pattern = pattern.upper()
+        if pattern not in {"GB", "GR", "RG", "BG"}:
+            raise ValueError("Bayer pattern must be one of: GB, GR, RG, BG")
+        packed_suffix = "Packed" if packed and bit % 8 else ""
+        self.set_capture_format(f"Bayer{pattern}{int(bit)}{packed_suffix}")
+
     def _configure_camera(self) -> None:
         self._set_enum("TriggerMode", hik.MV_TRIGGER_MODE_ON)
         self._set_enum("TriggerSource", hik.MV_TRIGGER_SOURCE_SOFTWARE)
         self._set_bool("AcquisitionFrameRateEnable", False)
-        self._set_enum_by_string("PixelFormat", "RGB8Packed")
+        if self.capture_format is not None:
+            self._set_enum_by_string("PixelFormat", self.capture_format)
 
     def _apply_setting_items(self) -> None:
         for key, value in self._setting_items:
             self.setitem(key, value)
+            if key == "PixelFormat" and isinstance(value, str):
+                self.capture_format = value
 
     def _allocate_buffers(self) -> None:
         st_param = hik.MVCC_INTVALUE()
@@ -282,11 +336,187 @@ class HikCamera(hik.MvCamera):
         self._frame_info = hik.MV_FRAME_OUT_INFO_EX()
         memset(byref(self._frame_info), 0, sizeof(self._frame_info))
 
+    @classmethod
+    def _format_from_pixel_type(cls, pixel_type: int | None) -> str | None:
+        if pixel_type is None:
+            return None
+        return cls._PIXEL_TYPE_FORMATS.get(int(pixel_type))
+
+    @classmethod
+    def _parse_bayer_format(cls, capture_format: str | None) -> tuple[str, int, bool] | None:
+        if not capture_format:
+            return None
+        match = cls._BAYER_FORMAT_RE.match(capture_format)
+        if not match:
+            return None
+        return match.group("pattern"), int(match.group("bit")), bool(match.group("packed"))
+
+    @staticmethod
+    def _bytes_to_uint16(raw: np.ndarray, height: int, width: int) -> np.ndarray:
+        return raw.view("<u2").reshape(height, width).astype(np.uint16, copy=False)
+
+    @staticmethod
+    def _unpack_bayer12_packed(raw: np.ndarray, height: int, width: int) -> np.ndarray:
+        raw16 = raw.astype(np.uint16)
+        middle = raw16[1::3]
+        left = (raw16[0::3] << 4) | (middle >> 4)
+        right = (raw16[2::3] << 4) | (middle & np.uint16(0x0F))
+
+        unpacked = np.empty(height * width, dtype=np.uint16)
+        unpacked[0::2] = left
+        unpacked[1::2] = right
+        return unpacked.reshape(height, width)
+
+    @staticmethod
+    def _scale_to_uint8(frame: np.ndarray, bit: int) -> np.ndarray:
+        if frame.dtype == np.uint8:
+            return frame
+        max_value = float((1 << bit) - 1)
+        return np.clip(frame.astype(np.float32) * (255.0 / max_value), 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _mono_to_rgb(frame: np.ndarray, bit: int) -> np.ndarray:
+        gray = HikCamera._scale_to_uint8(frame, bit)
+        return np.repeat(gray[:, :, None], 3, axis=2)
+
+    @classmethod
+    def _bayer_to_rgb(cls, raw: np.ndarray, pattern: str, bit: int) -> np.ndarray:
+        try:
+            import cv2
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "Bayer capture requires OpenCV. Install dependency `opencv-python-headless`."
+            ) from exc
+
+        code_name = f"COLOR_Bayer{pattern}2RGB"
+        code = getattr(cv2, code_name, None)
+        if code is None:
+            raise RuntimeError(f"OpenCV does not provide Bayer conversion {code_name}.")
+
+        rgb = cv2.cvtColor(raw, code)
+        return cls._scale_to_uint8(rgb, bit)
+
+    def _decode_frame_to_rgb(
+        self,
+        raw: np.ndarray,
+        height: int,
+        width: int,
+        frame_len: int,
+        pixel_type: int | None,
+    ) -> np.ndarray:
+        actual_format = self._format_from_pixel_type(pixel_type) or self.capture_format
+        self.last_capture_format = actual_format
+        self.last_pixel_type = pixel_type
+
+        bayer = self._parse_bayer_format(actual_format)
+        if bayer is not None:
+            pattern, bit, packed = bayer
+            if bit == 8 and not packed:
+                expected_frame_len = height * width
+                if frame_len != expected_frame_len:
+                    raise RuntimeError(
+                        f"Invalid {actual_format} frame length. Expected {expected_frame_len} bytes, "
+                        f"got {frame_len}."
+                    )
+                self.bit = bit
+                self.shape = (height, width)
+                return self._bayer_to_rgb(raw.reshape(height, width), pattern, bit)
+
+            if bit == 12 and packed:
+                expected_frame_len = height * width * 12 // 8
+                if frame_len != expected_frame_len:
+                    raise RuntimeError(
+                        f"Invalid {actual_format} frame length. Expected {expected_frame_len} bytes, "
+                        f"got {frame_len}."
+                    )
+                self.bit = bit
+                self.shape = (height, width)
+                return self._bayer_to_rgb(
+                    self._unpack_bayer12_packed(raw, height, width), pattern, bit
+                )
+
+            if bit in {10, 12, 16} and not packed:
+                expected_frame_len = height * width * 2
+                if frame_len != expected_frame_len:
+                    raise RuntimeError(
+                        f"Invalid {actual_format} frame length. Expected {expected_frame_len} bytes, "
+                        f"got {frame_len}."
+                    )
+                self.bit = bit
+                self.shape = (height, width)
+                return self._bayer_to_rgb(self._bytes_to_uint16(raw, height, width), pattern, bit)
+
+            raise RuntimeError(f"Unsupported Bayer capture format: {actual_format}")
+
+        if actual_format == "BGR8Packed":
+            expected_frame_len = height * width * 3
+            if frame_len != expected_frame_len:
+                raise RuntimeError(
+                    f"Invalid BGR8Packed frame length. Expected {expected_frame_len} bytes, got {frame_len}."
+                )
+            self.bit = 24
+            self.shape = (height, width, 3)
+            return raw.reshape(height, width, 3)[:, :, ::-1].copy()
+
+        if actual_format == "Mono8":
+            expected_frame_len = height * width
+            if frame_len != expected_frame_len:
+                raise RuntimeError(
+                    f"Invalid Mono8 frame length. Expected {expected_frame_len} bytes, got {frame_len}."
+                )
+            self.bit = 8
+            self.shape = (height, width)
+            return self._mono_to_rgb(raw.reshape(height, width), 8)
+
+        if actual_format == "Mono16":
+            expected_frame_len = height * width * 2
+            if frame_len != expected_frame_len:
+                raise RuntimeError(
+                    f"Invalid Mono16 frame length. Expected {expected_frame_len} bytes, got {frame_len}."
+                )
+            self.bit = 16
+            self.shape = (height, width)
+            return self._mono_to_rgb(self._bytes_to_uint16(raw, height, width), 16)
+
+        expected_rgb_len = height * width * 3
+        if frame_len == expected_rgb_len:
+            self.bit = 24
+            self.shape = (height, width, 3)
+            self.last_capture_format = actual_format or "RGB8Packed"
+            return raw.reshape(height, width, 3)
+
+        if actual_format is None and frame_len == height * width:
+            self.bit = 8
+            self.shape = (height, width)
+            self.last_capture_format = "Mono8"
+            return self._mono_to_rgb(raw.reshape(height, width), 8)
+
+        raise RuntimeError(
+            "Unsupported camera frame format. "
+            f"format={actual_format!r}, pixel_type={pixel_type!r}, "
+            f"width={width}, height={height}, frame_len={frame_len}."
+        )
+
+    def get_bayer_pattern(self) -> str:
+        bayer = self._parse_bayer_format(self.last_capture_format or self.capture_format)
+        if bayer is None:
+            raise RuntimeError("Current capture format is not a Bayer format.")
+        pattern, _, _ = bayer
+        return self._BAYER_PATTERNS[pattern]
+
+    @property
+    def is_raw(self) -> bool:
+        return self._parse_bayer_format(self.last_capture_format or self.capture_format) is not None
+
+    @property
+    def is_bayer(self) -> bool:
+        return self.is_raw
+
     def _validate_rgb8_output(self, frame: np.ndarray) -> None:
         if frame.dtype != np.uint8 or frame.ndim != 3 or frame.shape[2] != 3:
             raise RuntimeError(
-                "Camera must output RGB8Packed. Captured frame is not uint8 HxWx3. "
-                "Raw/Bayer formats are intentionally unsupported in this version."
+                "get_frame() must return RGB uint8 HxWx3. "
+                f"Captured frame has shape={frame.shape}, dtype={frame.dtype}."
             )
 
     def __enter__(self) -> "HikCamera":
@@ -327,16 +557,12 @@ class HikCamera(hik.MvCamera):
         height = int(self._frame_info.nHeight)
         width = int(self._frame_info.nWidth)
         frame_len = int(self._frame_info.nFrameLen)
-        expected_frame_len = height * width * 3
+        pixel_type = getattr(self._frame_info, "enPixelType", None)
+        if pixel_type is not None:
+            pixel_type = int(pixel_type)
 
-        if frame_len != expected_frame_len:
-            raise RuntimeError(
-                "Camera frame is not RGB8Packed. "
-                f"Expected {expected_frame_len} bytes, got {frame_len}."
-            )
-
-        frame = np.ctypeslib.as_array(self._data_buf, shape=(self._payload_size,))
-        return frame[:frame_len].copy().reshape(height, width, 3)
+        raw = np.ctypeslib.as_array(self._data_buf, shape=(self._payload_size,))
+        return self._decode_frame_to_rgb(raw[:frame_len].copy(), height, width, frame_len, pixel_type)
 
     def robust_get_frame(self) -> np.ndarray:
         return self.get_frame()

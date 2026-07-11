@@ -7,7 +7,7 @@ This repository is intentionally scoped to:
 - capture frames as RGB `numpy.ndarray`
 - set/get basic camera parameters: exposure and gain
 
-Everything else (raw/DNG pipeline, automatic recovery, multi-camera helper layer, extra demos/tests/docs) has been removed.
+Everything else (DNG pipeline, automatic recovery, multi-camera helper layer, extra demos/tests/docs) has been removed.
 
 ## Requirements
 
@@ -42,12 +42,32 @@ with HikCamera(ip="10.101.68.102") as cam:
     rgb = cam.robust_get_frame()
 ```
 
-## RGB-only behavior
+## Capture Format
 
-- The camera is forced to `PixelFormat=RGB8Packed`.
-- The library validates the first frame during `__enter__`.
-- If output is not RGB `uint8` (`H x W x 3`), initialization fails with a clear error.
-- Raw/Bayer handling is intentionally unsupported in this version.
+- `get_frame()` always returns RGB `uint8` (`H x W x 3`).
+- By default, the library does not change the camera `PixelFormat`.
+- Pass `capture_format` to request a specific camera output format.
+- Supported capture formats include `RGB8Packed`, `BGR8Packed`, `Mono8`, `Mono16`, Bayer 8-bit, Bayer 12-bit packed, and unpacked Bayer 10/12/16-bit.
+
+```python
+from hik_camera import HikCamera
+
+with HikCamera(ip="10.101.68.102", capture_format="RGB8Packed") as cam:
+    rgb = cam.get_frame()
+
+with HikCamera(ip="10.101.68.102", capture_format="BayerGB12Packed") as cam:
+    rgb = cam.get_frame()  # Bayer is demosaiced internally, still RGB uint8 HxWx3
+```
+
+You can also set `PixelFormat` through `setting_items`; this is treated as explicit user configuration:
+
+```python
+with HikCamera(
+    ip="10.101.68.102",
+    setting_items=[("PixelFormat", "BayerGB12Packed")],
+) as cam:
+    rgb = cam.get_frame()
+```
 
 ## Existing wrapper compatibility
 
