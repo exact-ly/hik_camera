@@ -73,15 +73,10 @@ with HikCamera(
 
 Set binning before the camera starts grabbing frames. `get_frame()` still returns RGB `uint8` (`H x W x 3`); the dimensions come from the camera after binning.
 
-When binning is configured through `binning` or `set_binning()`, `BinningMode` defaults to `Average`. Pass `binning_mode="Sum"` to request summed pixels, or `binning_mode=None` to leave the camera's current mode unchanged.
-
 ```python
 from hik_camera import HikCamera
 
 with HikCamera(ip="10.101.68.102", binning=2) as cam:
-    rgb = cam.get_frame()
-
-with HikCamera(ip="10.101.68.102", binning=2, binning_mode="Sum") as cam:
     rgb = cam.get_frame()
 
 with HikCamera(ip="10.101.68.102", binning=(2, 1)) as cam:
@@ -92,7 +87,7 @@ Equivalent pre-open setter:
 
 ```python
 cam = HikCamera(ip="10.101.68.102")
-cam.set_binning(2, mode="Average")
+cam.set_binning(2)
 
 with cam:
     rgb = cam.get_frame()
@@ -102,7 +97,6 @@ with cam:
 
 - `HikCamera(..., setting_items=[("Width", 1920), ("Height", 1080), ...])` is supported.
 - `HikCamera(..., setting_items=[("BinningHorizontal", 2), ("BinningVertical", 2)])` is supported.
-- `HikCamera(..., setting_items=[("BinningMode", "Average")])` is supported.
 - `camera["ParamName"] = value` is supported for common bool/int/float/string nodes.
 - `robust_get_frame()` is available as a compatibility alias to `get_frame()`.
 

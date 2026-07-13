@@ -86,7 +86,6 @@ class HikCamera(hik.MvCamera):
         capture_format: str | None = None,
         binning: int | tuple[int, int] | None = None,
         binning_selector: str | int | None = None,
-        binning_mode: str | int | None = "Average",
         setting_items: Iterable[tuple[str, Any]] | Mapping[str, Any] | None = None,
     ) -> None:
         if not ip:
@@ -99,7 +98,6 @@ class HikCamera(hik.MvCamera):
         self.capture_format = capture_format
         self.binning = self._normalize_binning(binning)
         self.binning_selector = binning_selector
-        self.binning_mode = binning_mode
         self.last_capture_format = None
         self.last_pixel_type = None
         self.bit = None
@@ -342,13 +340,11 @@ class HikCamera(hik.MvCamera):
         horizontal: int,
         vertical: int | None = None,
         selector: str | int | None = None,
-        mode: str | int | None = "Average",
     ) -> None:
         if self._is_open:
             raise RuntimeError("Binning must be set before opening the camera.")
         self.binning = self._normalize_binning((horizontal, horizontal if vertical is None else vertical))
         self.binning_selector = selector
-        self.binning_mode = mode
 
     def _apply_binning(self) -> None:
         if self.binning is None:
@@ -357,8 +353,6 @@ class HikCamera(hik.MvCamera):
         horizontal, vertical = self.binning
         if self.binning_selector is not None:
             self.setitem("BinningSelector", self.binning_selector)
-        if self.binning_mode is not None:
-            self.setitem("BinningMode", self.binning_mode)
         self.setitem("BinningHorizontal", horizontal)
         self.setitem("BinningVertical", vertical)
 
@@ -377,8 +371,6 @@ class HikCamera(hik.MvCamera):
                 self.capture_format = value
             elif key == "BinningSelector":
                 self.binning_selector = value
-            elif key == "BinningMode":
-                self.binning_mode = value
             elif key == "BinningHorizontal" and self.binning is not None:
                 self.binning = (int(value), self.binning[1])
             elif key == "BinningVertical" and self.binning is not None:
